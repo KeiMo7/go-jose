@@ -18,12 +18,14 @@ package jose
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/go-jose/go-jose/v4/json"
 )
@@ -74,6 +76,11 @@ type SignerOptions struct {
 	//
 	// [json.Marshal]: https://pkg.go.dev/encoding/json#Marshal
 	ExtraHeaders map[HeaderKey]interface{}
+
+	// Observer optionally enables runtime observability (progress callbacks
+	// and structured logging) for signing operations. Nil keeps the default
+	// behavior. See the Observer documentation for details.
+	Observer *Observer
 }
 
 // WithHeader adds an arbitrary value to the ExtraHeaders map, initializing it
@@ -138,6 +145,7 @@ type genericSigner struct {
 	nonceSource  NonceSource
 	embedJWK     bool
 	extraHeaders map[HeaderKey]interface{}
+	observer     *Observer
 }
 
 type recipientSigInfo struct {
@@ -175,6 +183,7 @@ func NewMultiSigner(sigs []SigningKey, opts *SignerOptions) (Signer, error) {
 		signer.nonceSource = opts.NonceSource
 		signer.embedJWK = opts.EmbedJWK
 		signer.extraHeaders = opts.ExtraHeaders
+		signer.observer = opts.Observer
 	}
 
 	for _, sig := range sigs {
@@ -288,11 +297,32 @@ func newJWKSigner(alg SignatureAlgorithm, signingKey JSONWebKey) (recipientSigIn
 }
 
 func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
+	return ctx.sign(context.Background(), payload)
+}
+
+// SignWithContext signs the payload like Sign, but the operation can be
+// cancelled via the provided context. Cancellation is checked between
+// recipients, so a cancelled multi-recipient signing aborts promptly with an
+// *OpError of Kind ErrKindCancelled instead of running to completion.
+func (ctx *genericSigner) SignWithContext(c context.Context, payload []byte) (*JSONWebSignature, error) {
+	if c == nil {
+		c = context.Background()
+	}
+	return ctx.sign(c, payload)
+}
+
+func (ctx *genericSigner) sign(c context.Context, payload []byte) (*JSONWebSignature, error) {
+	tr := newTracker("jws.sign", ctx.observer, int64(len(ctx.recipients)))
+
 	obj := &JSONWebSignature{}
 	obj.payload = payload
 	obj.Signatures = make([]Signature, len(ctx.recipients))
 
 	for i, recipient := range ctx.recipients {
+		if err := tr.cancelled(c, "sign-recipient"); err != nil {
+			return nil, err
+		}
+
 		protected := map[HeaderKey]interface{}{
 			headerAlgorithm: string(recipient.sigAlg),
 		}
@@ -311,7 +341,7 @@ func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
 				// key whose Algorithm contradicts its parameter set). Surface that
 				// as an error rather than letting mustSerializeJSON panic below.
 				if _, err := recipientPubKey.MarshalJSON(); err != nil {
-					return nil, err
+					return nil, tr.wrapError("sign-recipient", err, nil)
 				}
 				protected[headerJWK] = recipientPubKey
 			} else {
@@ -325,7 +355,7 @@ func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
 		if ctx.nonceSource != nil {
 			nonce, err := ctx.nonceSource.Nonce()
 			if err != nil {
-				return nil, fmt.Errorf("go-jose/go-jose: Error generating nonce: %v", err)
+				return nil, tr.wrapError("nonce", fmt.Errorf("go-jose/go-jose: Error generating nonce: %v", err), nil)
 			}
 			protected[headerNonce] = nonce
 		}
@@ -336,13 +366,13 @@ func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
 
 		serializedProtected, err := json.Marshal(protected)
 		if err != nil {
-			return nil, fmt.Errorf("go-jose/go-jose: Error marshaling JSON: %s", err)
+			return nil, tr.wrapError("sign-recipient", fmt.Errorf("go-jose/go-jose: Error marshaling JSON: %s", err), nil)
 		}
 		needsBase64 := true
 
 		if b64, ok := protected[headerB64]; ok {
 			if needsBase64, ok = b64.(bool); !ok {
-				return nil, errors.New("go-jose/go-jose: Invalid b64 header parameter")
+				return nil, tr.wrapError("sign-recipient", errors.New("go-jose/go-jose: Invalid b64 header parameter"), nil)
 			}
 		}
 
@@ -359,20 +389,24 @@ func (ctx *genericSigner) Sign(payload []byte) (*JSONWebSignature, error) {
 
 		signatureInfo, err := recipient.signer.signPayload(input.Bytes(), recipient.sigAlg)
 		if err != nil {
-			return nil, err
+			return nil, tr.wrapError("sign-recipient", err, map[string]string{
+				"alg": string(recipient.sigAlg),
+			})
 		}
 
 		signatureInfo.protected = &rawHeader{}
 		for k, v := range protected {
 			b, err := json.Marshal(v)
 			if err != nil {
-				return nil, fmt.Errorf("go-jose/go-jose: Error marshalling item %#v: %v", k, err)
+				return nil, tr.wrapError("sign-recipient", fmt.Errorf("go-jose/go-jose: Error marshalling item %#v: %v", k, err), nil)
 			}
 			(*signatureInfo.protected)[k] = makeRawMessage(b)
 		}
 		obj.Signatures[i] = signatureInfo
+		tr.step("sign-recipient")
 	}
 
+	tr.finish("done")
 	return obj, nil
 }
 
@@ -381,6 +415,7 @@ func (ctx *genericSigner) Options() SignerOptions {
 		NonceSource:  ctx.nonceSource,
 		EmbedJWK:     ctx.embedJWK,
 		ExtraHeaders: ctx.extraHeaders,
+		Observer:     ctx.observer,
 	}
 }
 
@@ -416,6 +451,23 @@ func (obj JSONWebSignature) Verify(verificationKey interface{}) ([]byte, error) 
 	return obj.payload, nil
 }
 
+// VerifyWithOptions validates the signature on the object like Verify, but
+// accepts a context for cancellation and an optional Observer for runtime
+// observability. Both may be nil, in which case it behaves exactly like
+// Verify. When obs is non-nil, failures are returned as *OpError wrapping
+// the original error; cancellation returns Kind ErrKindCancelled and
+// satisfies errors.Is(err, context.Canceled).
+func (obj JSONWebSignature) VerifyWithOptions(c context.Context, verificationKey interface{}, obs *Observer) ([]byte, error) {
+	if c == nil {
+		c = context.Background()
+	}
+	tr := newTracker("jws.verify", obs, int64(len(obj.Signatures)))
+	if err := obj.detachedVerify(c, obj.payload, verificationKey, tr); err != nil {
+		return nil, err
+	}
+	return obj.payload, nil
+}
+
 // UnsafePayloadWithoutVerification returns the payload without
 // verifying it. The content returned from this function cannot be
 // trusted.
@@ -431,19 +483,27 @@ func (obj JSONWebSignature) UnsafePayloadWithoutVerification() []byte {
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey interface{}) error {
+	return obj.detachedVerify(context.Background(), payload, verificationKey, nil)
+}
+
+func (obj JSONWebSignature) detachedVerify(c context.Context, payload []byte, verificationKey interface{}, tr *progressTracker) error {
+	if err := tr.cancelled(c, "verify-signature"); err != nil {
+		return err
+	}
+
 	if len(obj.Signatures) > 1 {
-		return errors.New("go-jose/go-jose: too many signatures in payload; expecting only one")
+		return tr.wrapError("verify-signature", errors.New("go-jose/go-jose: too many signatures in payload; expecting only one"), nil)
 	}
 
 	signature := obj.Signatures[0]
 
 	key, err := tryJWKS(verificationKey, signature.Header)
 	if err != nil {
-		return err
+		return tr.wrapError("key-selection", err, nil)
 	}
 	verifier, err := newVerifier(key)
 	if err != nil {
-		return err
+		return tr.wrapError("key-selection", err, nil)
 	}
 
 	if signature.header != nil {
@@ -454,29 +514,33 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 		// Protected Header."
 		err = signature.header.checkNoCritical()
 		if err != nil {
-			return err
+			return tr.wrapError("header-validation", err, nil)
 		}
 	}
 
 	if signature.protected != nil {
 		err = signature.protected.checkSupportedCritical(supportedCritical)
 		if err != nil {
-			return err
+			return tr.wrapError("header-validation", err, nil)
 		}
 	}
 
 	input, err := obj.computeAuthData(payload, &signature)
 	if err != nil {
-		return ErrCryptoFailure
+		return tr.wrapError("verify-signature", ErrCryptoFailure, nil)
 	}
 
 	headers := signature.mergedHeaders()
 	alg := headers.getSignatureAlgorithm()
 	err = verifier.verifyPayload(input, signature.Signature, alg)
 	if err != nil {
-		return ErrCryptoFailure
+		return tr.wrapError("verify-signature", ErrCryptoFailure, map[string]string{
+			"alg": string(alg),
+		})
 	}
 
+	tr.step("verify-signature")
+	tr.finish("done")
 	return nil
 }
 
@@ -489,6 +553,23 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) VerifyMulti(verificationKey interface{}) (int, Signature, []byte, error) {
 	idx, sig, err := obj.DetachedVerifyMulti(obj.payload, verificationKey)
+	if err != nil {
+		return -1, Signature{}, nil, err
+	}
+	return idx, sig, obj.payload, nil
+}
+
+// VerifyMultiWithOptions validates one of the multiple signatures on the
+// object like VerifyMulti, but accepts a context for cancellation and an
+// optional Observer for runtime observability. Both may be nil, in which
+// case it behaves exactly like VerifyMulti. Progress is reported per
+// signature attempted, with the total equal to the number of signatures.
+func (obj JSONWebSignature) VerifyMultiWithOptions(c context.Context, verificationKey interface{}, obs *Observer) (int, Signature, []byte, error) {
+	if c == nil {
+		c = context.Background()
+	}
+	tr := newTracker("jws.verify_multi", obs, int64(len(obj.Signatures)))
+	idx, sig, err := obj.detachedVerifyMulti(c, obj.payload, verificationKey, tr)
 	if err != nil {
 		return -1, Signature{}, nil, err
 	}
@@ -508,7 +589,15 @@ func (obj JSONWebSignature) VerifyMulti(verificationKey interface{}) (int, Signa
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey interface{}) (int, Signature, error) {
+	return obj.detachedVerifyMulti(context.Background(), payload, verificationKey, nil)
+}
+
+func (obj JSONWebSignature) detachedVerifyMulti(c context.Context, payload []byte, verificationKey interface{}, tr *progressTracker) (int, Signature, error) {
 	for i, signature := range obj.Signatures {
+		if err := tr.cancelled(c, "verify-signature"); err != nil {
+			return -1, Signature{}, err
+		}
+
 		if signature.header != nil {
 			// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
 			// 4.1.11. "crit" (Critical) Header Parameter
@@ -549,11 +638,16 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 		alg := headers.getSignatureAlgorithm()
 		err = verifier.verifyPayload(input, signature.Signature, alg)
 		if err != nil {
+			tr.step("verify-signature")
 			continue
 		}
 
+		tr.step("verify-signature")
+		tr.finish("done")
 		return i, signature, nil
 	}
 
-	return -1, Signature{}, ErrCryptoFailure
+	return -1, Signature{}, tr.wrapError("verify-signature", ErrCryptoFailure, map[string]string{
+		"signatures_tried": strconv.Itoa(len(obj.Signatures)),
+	})
 }

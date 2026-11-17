@@ -102,6 +102,67 @@ allows attaching a key id.
 
 <sup>2. Requires Go 1.27 or later</sup>
 
+## Runtime observability (opt-in)
+
+Signing and verification can optionally report progress, structured errors,
+and cancellation. The capability is disabled by default: every existing API
+keeps its signature, return values, and exact behavior unless an
+`jose.Observer` is provided. It uses only the standard library
+(`context`, `log/slog`), so no new dependencies are introduced.
+
+```go
+obs := &jose.Observer{
+    // Called at most once per ProgressInterval; panics inside the callback
+    // are logged and never abort the operation.
+    OnProgress: func(e jose.ProgressEvent) {
+        // e.Completed / e.Total (Total is -1 when unknown, e.g. streaming)
+        log.Printf("%s: %d/%d", e.Operation, e.Completed, e.Total)
+    },
+    ProgressInterval: 100 * time.Millisecond, // 0 = report every step
+    Logger:           slog.Default(),         // nil = no logging
+}
+
+// Signing: pass the observer via SignerOptions (new field, defaults to nil).
+signer, _ := jose.NewSigner(key, &jose.SignerOptions{Observer: obs})
+obj, _ := signer.(jose.ContextSigner).SignWithContext(ctx, payload)
+
+// Verification: use the new *WithOptions methods; nil observer/context
+// behaves exactly like Verify/VerifyMulti.
+payload, err := parsed.VerifyWithOptions(ctx, key, obs)
+```
+
+Failures are classified so callers can react without parsing strings:
+
+```go
+switch jwt.ClassifyError(err) {
+case jose.ErrKindSignatureMismatch:     // bad signature / MAC
+case jwt.ErrKindExpired:                // exp claim in the past
+case jose.ErrKindAlgorithmNotAllowed:   // alg not in the allow list
+case jose.ErrKindCancelled:             // ctx cancelled (not a failure)
+}
+```
+
+With an observer enabled, errors are returned as `*jose.OpError` wrapping the
+original error (`errors.Is`/`errors.As` keep working) with redacted context —
+algorithm names and counters only, never keys, payloads, or tokens.
+
+### Migrating existing code
+
+Existing code needs no changes; the zero values preserve current behavior
+(`SignerOptions.Observer == nil`, `Observer.ProgressInterval == 0`). To adopt
+observability for one call site, switch from the default methods to the
+context-aware variants:
+
+```go
+// Before:
+err := token.Claims(key, &claims)
+
+// After (behavior identical when ctx/obs are nil):
+payload, err := parsedJWS.VerifyWithOptions(context.Background(), key, nil)
+// or on a JWT parsed with jwt.ParseSigned:
+err := token.ClaimsWithOptions(context.Background(), nil, key, &claims)
+```
+
 ## Examples
 
 [![godoc](https://pkg.go.dev/badge/github.com/go-jose/go-jose/v4.svg)](https://pkg.go.dev/github.com/go-jose/go-jose/v4)

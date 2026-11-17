@@ -29,6 +29,7 @@ import (
 type JSONWebToken struct {
 	payload           func(k interface{}) ([]byte, error)
 	unverifiedPayload func() []byte
+	sig               *jose.JSONWebSignature
 	Headers           []jose.Header
 }
 
@@ -104,6 +105,7 @@ func ParseSigned(s string, signatureAlgorithms []jose.SignatureAlgorithm) (*JSON
 	return &JSONWebToken{
 		payload:           sig.Verify,
 		unverifiedPayload: sig.UnsafePayloadWithoutVerification,
+		sig:               sig,
 		Headers:           headers,
 	}, nil
 }
