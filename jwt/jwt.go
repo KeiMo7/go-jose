@@ -41,7 +41,12 @@ type NestedJSONWebToken struct {
 
 // Claims deserializes a JSONWebToken into dest using the provided key.
 func (t *JSONWebToken) Claims(key any, dest ...any) error {
-	b, err := t.payload(key)
+	verificationKey, err := t.resolveIssuerKey(key)
+	if err != nil {
+		return err
+	}
+
+	b, err := t.payload(verificationKey)
 	if err != nil {
 		return err
 	}
@@ -53,6 +58,21 @@ func (t *JSONWebToken) Claims(key any, dest ...any) error {
 	}
 
 	return nil
+}
+
+func (t *JSONWebToken) resolveIssuerKey(key any) (any, error) {
+	provider, ok := key.(IssuerKeyProvider)
+	if !ok || t.unverifiedPayload == nil {
+		return key, nil
+	}
+
+	var claims struct {
+		Issuer string `json:"iss"`
+	}
+	if err := json.Unmarshal(t.unverifiedPayload(), &claims); err != nil {
+		return nil, err
+	}
+	return provider.KeyProviderForIssuer(claims.Issuer)
 }
 
 // UnsafeClaimsWithoutVerification deserializes the claims of a

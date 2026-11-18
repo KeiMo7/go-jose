@@ -435,32 +435,28 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey any) 
 
 	signature := obj.Signatures[0]
 
-	key, err := tryJWKS(verificationKey, signature.Header)
-	if err != nil {
-		return err
-	}
-	verifier, err := newVerifier(key)
-	if err != nil {
-		return err
-	}
-
 	if signature.header != nil {
 		// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
 		// 4.1.11. "crit" (Critical) Header Parameter
 		// "When used, this Header Parameter MUST be integrity
 		// protected; therefore, it MUST occur only within the JWS
 		// Protected Header."
-		err = signature.header.checkNoCritical()
+		err := signature.header.checkNoCritical()
 		if err != nil {
 			return err
 		}
 	}
 
 	if signature.protected != nil {
-		err = signature.protected.checkSupportedCritical(supportedCritical)
+		err := signature.protected.checkSupportedCritical(supportedCritical)
 		if err != nil {
 			return err
 		}
+	}
+
+	keys, isSet, err := verificationKeys(verificationKey, signature.Header)
+	if err != nil {
+		return err
 	}
 
 	input, err := obj.computeAuthData(payload, &signature)
@@ -470,12 +466,32 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey any) 
 
 	headers := signature.mergedHeaders()
 	alg := headers.getSignatureAlgorithm()
-	err = verifier.verifyPayload(input, signature.Signature, alg)
-	if err != nil {
-		return ErrCryptoFailure
+	var setupErr error
+	for _, key := range keys {
+		verifier, err := newVerifier(key)
+		if err != nil {
+			if setupErr == nil {
+				setupErr = err
+			}
+			continue
+		}
+		if err := verifier.verifyPayload(input, signature.Signature, alg); err != nil {
+			continue
+		}
+		return nil
 	}
 
-	return nil
+	if isSet {
+		return &JWKSVerificationError{
+			KeyID:     signature.Header.KeyID,
+			Attempted: len(keys),
+		}
+	}
+
+	if setupErr != nil {
+		return setupErr
+	}
+	return ErrCryptoFailure
 }
 
 // VerifyMulti validates (one of the multiple) signatures on the object and
@@ -527,13 +543,9 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 			}
 		}
 
-		// If the verification key is a JWK Set, pick a key based on this signature's
-		// "kid" header. If no match, skip this signature.
-		key, err := tryJWKS(verificationKey, signature.Header)
-		if err != nil {
-			continue
-		}
-		verifier, err := newVerifier(key)
+		// If the verification key is a JWK Set or provider, resolve all keys
+		// matching this signature's "kid" header and try them in order.
+		keys, _, err := verificationKeys(verificationKey, signature.Header)
 		if err != nil {
 			continue
 		}
@@ -545,12 +557,17 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 
 		headers := signature.mergedHeaders()
 		alg := headers.getSignatureAlgorithm()
-		err = verifier.verifyPayload(input, signature.Signature, alg)
-		if err != nil {
-			continue
+		for _, key := range keys {
+			verifier, err := newVerifier(key)
+			if err != nil {
+				continue
+			}
+			err = verifier.verifyPayload(input, signature.Signature, alg)
+			if err != nil {
+				continue
+			}
+			return i, signature, nil
 		}
-
-		return i, signature, nil
 	}
 
 	return -1, Signature{}, ErrCryptoFailure

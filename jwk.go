@@ -934,33 +934,89 @@ var (
 	ErrJWKSKidNotFound = errors.New("go-jose/go-jose: JWK with matching kid not found in JWK Set")
 )
 
-func tryJWKS(key any, header Header) (any, error) {
-	var jwks JSONWebKeySet
+// JWKSProvider supplies verification keys for a JOSE header.
+//
+// Implementations may fetch a remote JWKS lazily, refresh cached keys, or
+// otherwise rotate keys transparently. Returning more than one key for the
+// same kid is allowed; verification will try each key in order.
+type JWKSProvider interface {
+	Keys(header Header) ([]JSONWebKey, error)
+}
 
-	switch jwksType := key.(type) {
+// JWKSVerificationError is returned when every key supplied by a JWKS for a
+// token's kid failed verification.
+type JWKSVerificationError struct {
+	KeyID     string
+	Attempted int
+}
+
+func (e *JWKSVerificationError) Error() string {
+	return fmt.Sprintf("go-jose/go-jose: JWKS verification failed for kid %q after trying %d key(s)", e.KeyID, e.Attempted)
+}
+
+// Unwrap preserves compatibility with callers which check for
+// ErrCryptoFailure while also exposing a distinct JWKS verification error.
+func (e *JWKSVerificationError) Unwrap() error {
+	return ErrCryptoFailure
+}
+
+func verificationKeys(key any, header Header) ([]any, bool, error) {
+	var (
+		keys  []JSONWebKey
+		isSet bool
+	)
+
+	switch jwks := key.(type) {
 	case *JSONWebKeySet:
-		jwks = *jwksType
+		isSet = true
+		if jwks != nil {
+			keys = jwks.Key(header.KeyID)
+		}
 	case JSONWebKeySet:
-		jwks = jwksType
+		isSet = true
+		keys = jwks.Key(header.KeyID)
+	case JWKSProvider:
+		isSet = true
+		if jwks == nil {
+			return nil, true, ErrJWKSKidNotFound
+		}
+		value := reflect.ValueOf(jwks)
+		switch value.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if value.IsNil() {
+				return nil, true, ErrJWKSKidNotFound
+			}
+		}
+		if header.KeyID == "" {
+			return nil, true, ErrJWKSKidNotFound
+		}
+		var err error
+		keys, err = jwks.Keys(header)
+		if err != nil {
+			return nil, true, err
+		}
 	default:
-		// If the specified key is not a JWKS, return as is.
-		return key, nil
+		return []any{key}, false, nil
 	}
 
 	// If no KID is specified in the header, reject.
-	kid := header.KeyID
-	if kid == "" {
-		return nil, ErrJWKSKidNotFound
+	if header.KeyID == "" || len(keys) == 0 {
+		return nil, isSet, ErrJWKSKidNotFound
 	}
 
-	// Find the JWK with the matching KID. If no JWK with the specified KID is
-	// found, reject.
-	keys := jwks.Key(kid)
-	if len(keys) == 0 {
-		return nil, ErrJWKSKidNotFound
+	out := make([]any, len(keys))
+	for i := range keys {
+		out[i] = keys[i].Key
 	}
+	return out, isSet, nil
+}
 
-	return keys[0].Key, nil
+func tryJWKS(key any, header Header) (any, error) {
+	keys, _, err := verificationKeys(key, header)
+	if err != nil {
+		return nil, err
+	}
+	return keys[0], nil
 }
 
 // weakEd25519PublicKeys contains the low-order Ed25519 encodings accepted by
