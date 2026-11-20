@@ -167,6 +167,16 @@ func ParseEncryptedJSON(
 		return nil, err
 	}
 
+	return sanitizeJSONWebEncryption(&parsed, keyEncryptionAlgorithms, contentEncryption)
+}
+
+// sanitizeJSONWebEncryption produces a cleaned-up JWE object from the raw JSON.
+// It is shared by the legacy JSON entry point and the hardened policy entry
+// points so that both serialization paths run the same parsing logic.
+func sanitizeJSONWebEncryption(parsed *rawJSONWebEncryption,
+	keyEncryptionAlgorithms []KeyAlgorithm,
+	contentEncryption []ContentEncryption,
+) (*JSONWebEncryption, error) {
 	return parsed.sanitized(keyEncryptionAlgorithms, contentEncryption)
 }
 
