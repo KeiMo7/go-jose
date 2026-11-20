@@ -37,6 +37,12 @@ import (
 // randReader is a cryptographically secure random number generator (stubbed out in tests).
 var randReader = rand.Reader
 
+// pbkdf2Key derives a key with PBKDF2. It is a variable so tests can exercise
+// derivation failures.
+var pbkdf2Key = func(h func() hash.Hash, password string, salt []byte, iter, keyLength int) ([]byte, error) {
+	return pbkdf2.Key(h, password, salt, iter, keyLength)
+}
+
 const (
 	// RFC7518 recommends a minimum of 1,000 iterations:
 	// 	- https://tools.ietf.org/html/rfc7518#section-4.8.1.2
@@ -329,7 +335,7 @@ func (ctx *symmetricKeyCipher) encryptKey(cek []byte, alg KeyAlgorithm) (recipie
 
 		// derive key
 		keyLen, h := getPbkdf2Params(alg)
-		key, err := pbkdf2.Key(h, string(ctx.key), salt, ctx.p2c, keyLen)
+		key, err := pbkdf2Key(h, string(ctx.key), salt, ctx.p2c, keyLen)
 		if err != nil {
 			return recipientInfo{}, nil
 		}
@@ -432,7 +438,7 @@ func (ctx *symmetricKeyCipher) decryptKey(headers rawHeader, recipient *recipien
 		if p2c <= 0 {
 			return nil, fmt.Errorf("go-jose/go-jose: invalid P2C: must be a positive integer")
 		}
-		if p2c > 1000000 {
+		if p2c > maxPBES2Iterations {
 			// An unauthenticated attacker can set a high P2C value. Set an upper limit to avoid
 			// DoS attacks.
 			return nil, fmt.Errorf("go-jose/go-jose: invalid P2C: too high")
@@ -444,15 +450,15 @@ func (ctx *symmetricKeyCipher) decryptKey(headers rawHeader, recipient *recipien
 
 		// derive key
 		keyLen, h := getPbkdf2Params(alg)
-		key, err := pbkdf2.Key(h, string(ctx.key), salt, p2c, keyLen)
+		key, err := pbkdf2Key(h, string(ctx.key), salt, p2c, keyLen)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrPBES2Derivation, err)
 		}
 
 		// use AES cipher with derived key
 		block, err := aes.NewCipher(key)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrPBES2Derivation, err)
 		}
 
 		cek, err := josecipher.KeyUnwrap(block, encryptedKey)
